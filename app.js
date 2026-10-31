@@ -5,13 +5,15 @@ import { buildPdf } from './pdf.js';
 import * as DB from './store.js';
 import * as DBX from './dropbox.js';
 
-export const VERSION = '1.1.1';
+export const VERSION = '1.2.0';
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const SRC_MAX = 3000;          // Originalfotos auf max. 3000 px lange Seite
 const OUT_MAX = Math.round(11.69 * CONFIG.DPI); // A4 lang bei Ziel-DPI
-const DEF_OPTS = { native: false, filter: 'farbe', auto: true, lastFirma: null };
+const DEF_OPTS = { native: true, filter: 'farbe', auto: true, lastFirma: null };
 const opts = loadOpts();
+// Felix, 31.10.: iPhone-Kamera ist viel schärfer als das Live-Bild, daher einmalig für alle auf Standard umstellen
+if (!opts.v2) { opts.native = true; opts.v2 = true; saveOpts(); }
 
 let pages = [];                // aktueller Scan
 let stream = null, liveTimer = null;

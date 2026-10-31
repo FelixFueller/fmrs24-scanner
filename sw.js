@@ -1,5 +1,5 @@
 // Offline-Start: App-Dateien zwischenspeichern. Dropbox-Aufrufe gehen nie über den Cache.
-const VERSION = 'fmrs-scan-1.1.1';
+const VERSION = 'fmrs-scan-1.2.0';
 const FILES = ['./', 'index.html', 'app.css', 'app.js', 'scan.js', 'pdf.js', 'store.js', 'dropbox.js', 'config.js',
   'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(FILES)).then(() => self.skipWaiting())); });
