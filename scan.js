@@ -166,62 +166,331 @@ export function orderQuad(q) {
   return [0, 1, 2, 3].map(i => s[(start + i) % 4]);
 }
 
-function quadFromMask(mask, w, h) {
-  const comp = largestComponent(mask, w, h);
-  if (comp.id < 0 || comp.size < w * h * 0.12) return null;
+// ---------- Blatterkennung: mehrere Kandidaten, jeder wird an den Blattkanten geprüft ----------
+function labelComponents(mask, w, h) {
+  const lab = new Int32Array(w * h), stack = new Int32Array(w * h), sizes = [0];
+  let cur = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (!mask[i] || lab[i]) continue;
+    cur++; let sp = 0, size = 0; stack[sp++] = i; lab[i] = cur;
+    while (sp) {
+      const p = stack[--sp]; size++;
+      const x = p % w, y = (p / w) | 0;
+      if (x > 0 && mask[p - 1] && !lab[p - 1]) { lab[p - 1] = cur; stack[sp++] = p - 1; }
+      if (x < w - 1 && mask[p + 1] && !lab[p + 1]) { lab[p + 1] = cur; stack[sp++] = p + 1; }
+      if (y > 0 && mask[p - w] && !lab[p - w]) { lab[p - w] = cur; stack[sp++] = p - w; }
+      if (y < h - 1 && mask[p + w] && !lab[p + w]) { lab[p + w] = cur; stack[sp++] = p + w; }
+    }
+    sizes.push(size);
+  }
+  return { lab, sizes };
+}
+
+function hullOf(lab, id, w, h) {
   const pts = [];
-  const { lab, id } = comp;
   for (let y = 0; y < h; y++) {
     let first = -1, last = -1;
     for (let x = 0; x < w; x++) if (lab[y * w + x] === id) { if (first < 0) first = x; last = x; }
-    if (first >= 0) { pts.push([first, y]); if (last !== first) pts.push([last + 1, y]); }
+    if (first >= 0) { pts.push([first, y]); pts.push([last + 1, y]); }
   }
-  for (let x = 0; x < w; x++) { // auch spaltenweise, damit oben/unten exakt sind
+  for (let x = 0; x < w; x++) {
     let first = -1, last = -1;
     for (let y = 0; y < h; y++) if (lab[y * w + x] === id) { if (first < 0) first = y; last = y; }
     if (first >= 0) { pts.push([x, first]); pts.push([x, last + 1]); }
   }
-  const hull = convexHull(pts);
-  const q = maxQuad(hull);
-  if (!q) return null;
-  const qa = polyArea(q), ha = polyArea(hull);
-  // Plausibel: Viereck füllt die Hülle fast, ist groß genug, nicht das ganze Bild
-  if (qa < w * h * 0.12 || qa / ha < 0.88 || qa > w * h * 0.985) return null;
-  return { quad: orderQuad(q), score: qa / ha };
+  return convexHull(pts);
 }
 
-// Hauptfunktion: liefert 4 Ecken in Koordinaten der Quelle oder null
-export function detectQuad(src, srcW, srcH, maxSide = 480) {
+function sobel(g, w, h) {
+  const gx = new Float32Array(w * h), gy = new Float32Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x;
+    const a = g[i - w - 1], b = g[i - w], c = g[i - w + 1], d = g[i - 1], f = g[i + 1], k = g[i + w - 1], l = g[i + w], m = g[i + w + 1];
+    gx[i] = (c + 2 * f + m) - (a + 2 * d + k);
+    gy[i] = (k + 2 * l + m) - (a + 2 * b + c);
+  }
+  return { gx, gy };
+}
+
+const thresholdMask = (ch, t) => { const m = new Uint8Array(ch.length); for (let i = 0; i < ch.length; i++) m[i] = ch[i] > t ? 1 : 0; return m; };
+
+// Anteil einer Seite, an dem eine gleichgerichtete Kante quer zur Seite verläuft.
+// Gezählt wird nur die vorherrschende Richtung (Blatt heller oder dunkler als der Tisch), Muster mischen beide.
+function sideSupport(G, w, h, a, b, tE) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+  if (len < 4) return 0;
+  const nx = -dy / len, ny = dx / len;
+  let pos = 0, neg = 0, tot = 0;
+  const N = Math.max(12, Math.min(48, Math.round(len / 4)));
+  for (let s = 0; s < N; s++) {
+    const t = 0.08 + 0.84 * s / (N - 1);
+    const px = a[0] + dx * t, py = a[1] + dy * t;
+    if (px < 3 || py < 3 || px > w - 4 || py > h - 4) continue; // Teil der Seite außerhalb des Bildes
+    let best = 0;
+    for (let o = -2.5; o <= 2.5; o += 1) {
+      const x = Math.round(px + nx * o), y = Math.round(py + ny * o);
+      if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
+      const i = y * w + x, v = G.gx[i] * nx + G.gy[i] * ny;
+      if (Math.abs(v) > Math.abs(best)) best = v;
+    }
+    tot++;
+    if (best > tE) pos++; else if (best < -tE) neg++;
+  }
+  if (tot < N * 0.3) return 0; // zu wenig von der Seite sichtbar
+  return (Math.max(pos, neg) - 0.5 * Math.min(pos, neg)) / tot;
+}
+
+function onBorder(a, b, w, h, bt) {
+  return (a[0] < bt && b[0] < bt) || (a[1] < bt && b[1] < bt) || (a[0] > w - bt && b[0] > w - bt) || (a[1] > h - bt && b[1] > h - bt);
+}
+
+function angleOk(q) {
+  for (let i = 0; i < 4; i++) {
+    const p = q[(i + 3) % 4], c = q[i], n = q[(i + 1) % 4];
+    const v1 = [p[0] - c[0], p[1] - c[1]], v2 = [n[0] - c[0], n[1] - c[1]];
+    const cos = (v1[0] * v2[0] + v1[1] * v2[1]) / (Math.hypot(...v1) * Math.hypot(...v2) + 1e-9);
+    const ang = Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
+    if (ang < 40 || ang > 140) return false;
+  }
+  return true;
+}
+
+function pointInQuad(p, q) {
+  let c = false;
+  for (let i = 0, j = 3; i < 4; j = i++) {
+    const [xi, yi] = q[i], [xj, yj] = q[j];
+    if ((yi > p[1]) !== (yj > p[1]) && p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+
+// Wie unruhig ist ein schmaler Streifen direkt innerhalb der Seiten? Papier hat dort Rand, ein Textblock nicht.
+function insideBusy(q, mags, w, h, tE) {
+  const cx = q.reduce((s, p) => s + p[0], 0) / 4, cy = q.reduce((s, p) => s + p[1], 0) / 4;
+  const off = Math.max(6, Math.round(Math.max(w, h) / 55));
+  const per = [];
+  for (let k = 0; k < 4; k++) {
+    const a = q[k], b = q[(k + 1) % 4], dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+    let nx = -dy / len, ny = dx / len, hit = 0, tot = 0;
+    const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+    if ((cx - mx) * nx + (cy - my) * ny < 0) { nx = -nx; ny = -ny; } // nach innen
+    for (let s = 0; s < 30; s++) {
+      const t = 0.12 + 0.76 * s / 29;
+      for (const o of [off, off * 1.5, off * 2]) {
+        const x = Math.round(a[0] + dx * t + nx * o), y = Math.round(a[1] + dy * t + ny * o);
+        if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
+        tot++; if (mags[y * w + x] > tE) hit++;
+      }
+    }
+    if (tot) per.push(hit / tot);
+  }
+  if (per.length < 2) return 1;
+  per.sort((a, b) => a - b);
+  return per[1]; // mindestens zwei Seiten mit ruhigem Rand
+}
+
+function scoreQuad(q, hullArea, G, w, h, tE, mags) {
+  const qa = polyArea(q), af = qa / (w * h);
+  const outside = q.some(([x, y]) => x < -1 || y < -1 || x > w + 1 || y > h + 1);
+  if (af < 0.05 || (!outside && af > 0.995) || !angleOk(q)) return null;
+  if (q.some(([x, y]) => x < -0.4 * w || y < -0.4 * h || x > 1.4 * w || y > 1.4 * h)) return null;
+  const bt = Math.max(w, h) * 0.02;
+  let nb = 0, through = 0; const sup = [];
+  for (let i = 0; i < 4; i++) {
+    const a = q[i], b = q[(i + 1) % 4];
+    if (onBorder(a, b, w, h, bt)) { nb++; continue; }
+    sup.push(sideSupport(G, w, h, a, b, tE));
+    // Läuft die Kante über beide Ecken hinaus weiter (z.B. Schattenlinie), ist es kein Blattrand
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const e1 = sideSupport(G, w, h, [b[0] + dx * 0.03, b[1] + dy * 0.03], [b[0] + dx * 0.12, b[1] + dy * 0.12], tE);
+    const e2 = sideSupport(G, w, h, [a[0] - dx * 0.12, a[1] - dy * 0.12], [a[0] - dx * 0.03, a[1] - dy * 0.03], tE);
+    if (Math.min(e1, e2) > 0.5) through++;
+  }
+  if (nb > 2 || !sup.length) return null;
+  const minS = Math.min(...sup), meanS = sup.reduce((s, v) => s + v, 0) / sup.length;
+  const rect = hullArea ? Math.min(1, qa / hullArea) : 1;
+  const busy = insideBusy(q, mags, w, h, tE);
+  const score = 0.55 * minS + 0.3 * meanS + 0.15 * rect - 0.05 * nb - 0.6 * Math.max(0, busy - 0.25) - 0.3 * through;
+  return { quad: q, score, area: qa, busy, confident: minS >= 0.5 && meanS >= 0.65 && rect >= 0.88 && busy < 0.45 && !through, nb };
+}
+
+function simplify(pts, eps) { // Douglas-Peucker auf geschlossenem Polygon
+  if (pts.length < 4) return pts;
+  let far = 0, fd = -1; // Startpunkt: weitester Punkt von pts[0]
+  pts.forEach((p, i) => { const d = Math.hypot(p[0] - pts[0][0], p[1] - pts[0][1]); if (d > fd) { fd = d; far = i; } });
+  const dp = (a) => {
+    if (a.length < 3) return a;
+    const [x1, y1] = a[0], [x2, y2] = a[a.length - 1], L = Math.hypot(x2 - x1, y2 - y1) || 1;
+    let im = 0, dm = 0;
+    for (let i = 1; i < a.length - 1; i++) { const d = Math.abs((x2 - x1) * (y1 - a[i][1]) - (x1 - a[i][0]) * (y2 - y1)) / L; if (d > dm) { dm = d; im = i; } }
+    if (dm <= eps) return [a[0], a[a.length - 1]];
+    return dp(a.slice(0, im + 1)).slice(0, -1).concat(dp(a.slice(im)));
+  };
+  const A = pts.slice(0, far + 1), B = pts.slice(far).concat([pts[0]]);
+  return dp(A).slice(0, -1).concat(dp(B).slice(0, -1));
+}
+function intersect(a1, a2, b1, b2) {
+  const d1 = [a2[0] - a1[0], a2[1] - a1[1]], d2 = [b2[0] - b1[0], b2[1] - b1[1]];
+  const det = d1[0] * d2[1] - d1[1] * d2[0];
+  if (Math.abs(det) < 1e-6 * Math.hypot(...d1) * Math.hypot(...d2)) return null;
+  const t = ((b1[0] - a1[0]) * d2[1] - (b1[1] - a1[1]) * d2[0]) / det;
+  return [a1[0] + d1[0] * t, a1[1] + d1[1] * t];
+}
+// Blatt ragt aus dem Bild: Seiten am Bildrand weglassen, die 4 echten Seiten verlängern und schneiden
+function quadThroughBorder(hull, w, h) {
+  const bt = Math.max(w, h) * 0.02;
+  const poly = simplify(hull, Math.hypot(w, h) * 0.012);
+  if (poly.length < 5 || poly.length > 8) return null;
+  const edges = poly.map((p, i) => [p, poly[(i + 1) % poly.length]]);
+  const real = edges.filter(([a, b]) => !onBorder(a, b, w, h, bt) && Math.hypot(b[0] - a[0], b[1] - a[1]) > Math.max(w, h) * 0.05);
+  if (real.length !== 4 || edges.length - real.length < 1) return null;
+  const q = [];
+  for (let i = 0; i < 4; i++) { const c = intersect(...real[i], ...real[(i + 1) % 4]); if (!c) return null; q.push(c); }
+  return q;
+}
+
+// Hauptfunktion. Liefert { quad, confident, score } in Quell-Koordinaten oder null.
+// quad ist bei confident=false nur ein Vorschlag (Ecken prüfen lassen).
+export function findDocument(src, srcW, srcH, { maxSide = 512, refine = true } = {}) {
+  const { canvas, scale } = scaledCanvas(src, srcW, srcH, maxSide);
+  const w = canvas.width, h = canvas.height, n = w * h;
+  const data = ctx2d(canvas).getImageData(0, 0, w, h).data;
+  const gray = toGray(data, n);
+  const gB = boxBlur(gray, w, h, 1);
+  const G = sobel(gB, w, h);
+  // Kantenschwelle: Rauschen schätzen (Median der Gradienten), mindestens 14
+  const mags = new Float32Array(n); for (let i = 0; i < n; i++) mags[i] = Math.abs(G.gx[i]) + Math.abs(G.gy[i]);
+  const sample = Array.from(mags.filter((_, i) => i % 7 === 0)).sort((a, b) => a - b);
+  const med = sample[sample.length >> 1] || 0;
+  const tE = Math.max(14, med * 3.5);
+
+  const r = Math.max(1, Math.round(Math.max(w, h) / 160));
+  const blur = ch => boxBlur(ch, w, h, r);
+  const clean = m => morph(morph(morph(morph(m, w, h, r, false), w, h, r, true), w, h, r * 2, true), w, h, r * 2, false);
+  const masks = [];
+  // 1) Helligkeit
+  const gr = blur(gray); masks.push(clean(thresholdMask(gr, otsu(gr))));
+  // 2) "Papier": hell und wenig bunt
+  const paper = new Uint8ClampedArray(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) { const mx = Math.max(data[j], data[j + 1], data[j + 2]), mn = Math.min(data[j], data[j + 1], data[j + 2]); paper[i] = mx - (mx - mn) * 0.9; }
+  const pb = blur(paper); masks.push(clean(thresholdMask(pb, otsu(pb))));
+  // 3) Farbabstand zum Tisch (Farbe am Bildrand)
+  const rim = [[], [], []], bw = Math.max(2, Math.round(Math.min(w, h) * 0.03));
+  for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) if (x < bw || y < bw || x >= w - bw || y >= h - bw) { const j = (y * w + x) * 4; rim[0].push(data[j]); rim[1].push(data[j + 1]); rim[2].push(data[j + 2]); }
+  const bgc = rim.map(a => a.sort((p, q) => p - q)[a.length >> 1]);
+  const dist = new Uint8ClampedArray(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) dist[i] = (Math.abs(data[j] - bgc[0]) + Math.abs(data[j + 1] - bgc[1]) + Math.abs(data[j + 2] - bgc[2])) * 0.6;
+  const db = blur(dist); masks.push(clean(thresholdMask(db, Math.max(18, otsu(db)))));
+  // 4) Umschlossen von Kanten (hilft bei weißem Blatt auf hellem Tisch und bei Schatten)
+  for (const f of [1, 2]) {
+    let edge = new Uint8Array(n);
+    for (let i = 0; i < n; i++) edge[i] = mags[i] > tE * f * 0.75 ? 1 : 0;
+    edge = morph(edge, w, h, 1, true);
+    const out = new Uint8Array(n), st = [];
+    const push = i => { if (!edge[i] && !out[i]) { out[i] = 1; st.push(i); } };
+    for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+    for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+    while (st.length) { const p = st.pop(), x = p % w; if (x > 0) push(p - 1); if (x < w - 1) push(p + 1); if (p >= w) push(p - w); if (p < n - w) push(p + w); }
+    let ins = new Uint8Array(n); for (let i = 0; i < n; i++) ins[i] = out[i] ? 0 : 1;
+    masks.push(morph(morph(ins, w, h, r, false), w, h, r, true));
+  }
+
+  const cands = [];
+  for (const m of masks) {
+    const { lab, sizes } = labelComponents(m, w, h);
+    const ids = sizes.map((s, i) => [s, i]).slice(1).filter(([s]) => s > n * 0.04).sort((a, b) => b[0] - a[0]).slice(0, 3);
+    for (const [, id] of ids) {
+      const hull = hullOf(lab, id, w, h);
+      const ha = polyArea(hull);
+      const q = maxQuad(hull);
+      if (q) { const sc = scoreQuad(orderQuad(q), ha, G, w, h, tE, mags); if (sc) cands.push(sc); }
+      const qb = quadThroughBorder(hull, w, h);
+      if (qb) { const sc = scoreQuad(orderQuad(qb), 0, G, w, h, tE, mags); if (sc) cands.push(sc); }
+    }
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => b.score - a.score);
+  if (typeof window !== 'undefined' && window.__scanDebug) window.__scanDebug = cands.map(c => ({ s: +c.score.toFixed(2), conf: c.confident, busy: +c.busy.toFixed(2), a: Math.round(c.area), q: c.quad.map(p => p.map(v => Math.round(v / scale))) }));
+  let best = cands[0];
+  // Gibt es ein größeres, ebenfalls sicheres Viereck, das das beste enthält (z.B. dunkler Briefkopf)? Dann das.
+  if (best.confident) {
+    for (const c of cands) {
+      if (c === best || !c.confident || c.area < best.area * 1.06 || c.score < best.score - 0.2) continue;
+      const cx = best.quad.reduce((s, p) => s + p[0], 0) / 4, cy = best.quad.reduce((s, p) => s + p[1], 0) / 4;
+      const shrunk = best.quad.map(([x, y]) => [x + (cx - x) * 0.04, y + (cy - y) * 0.04]);
+      if (shrunk.every(p => pointInQuad(p, c.quad)) && (!best.big || c.area > best.area)) best = Object.assign({}, c, { big: true });
+    }
+  }
+  let quad = best.quad.map(([x, y]) => [x / scale, y / scale]);
+  if (refine && best.confident) quad = refineQuad(src, srcW, srcH, quad);
+  // minimal nach innen (0,5 % zur Mitte), damit kein Tischrand im Scan bleibt
+  const cx = quad.reduce((a, p) => a + p[0], 0) / 4, cy = quad.reduce((a, p) => a + p[1], 0) / 4;
+  quad = quad.map(([x, y]) => [x + (cx - x) * 0.005, y + (cy - y) * 0.005]);
+  return { quad, confident: best.confident, score: best.score };
+}
+
+// Ecken genauer: entlang jeder Seite die stärkste Kante suchen, Geraden einpassen, schneiden
+export function refineQuad(src, srcW, srcH, quad, maxSide = 1400) {
   const { canvas, scale } = scaledCanvas(src, srcW, srcH, maxSide);
   const w = canvas.width, h = canvas.height;
-  const data = ctx2d(canvas).getImageData(0, 0, w, h).data;
-  const n = w * h;
-  // Helligkeit und "Papier-Wert" (hell und wenig bunt)
-  const gray = toGray(data, n);
-  const paper = new Uint8ClampedArray(n);
-  for (let i = 0, j = 0; i < n; i++, j += 4) {
-    const r = data[j], g = data[j + 1], b = data[j + 2];
-    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-    paper[i] = mx - (mx - mn) * 0.9; // Sättigung abziehen
+  const g = boxBlur(toGray(ctx2d(canvas).getImageData(0, 0, w, h).data, w * h), w, h, 1);
+  const q = quad.map(([x, y]) => [x * scale, y * scale]);
+  const diag = Math.hypot(w, h), R = Math.max(4, Math.round(diag * 0.008)), bt = Math.max(w, h) * 0.02;
+  const at = (x, y) => { // bilinear
+    if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return null;
+    const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * w + x0;
+    return (g[i] * (1 - fx) + g[i + 1] * fx) * (1 - fy) + (g[i + w] * (1 - fx) + g[i + w + 1] * fx) * fy;
+  };
+  const lines = [];
+  for (let k = 0; k < 4; k++) {
+    const a = q[k], b = q[(k + 1) % 4];
+    const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+    const nx = -dy / len, ny = dx / len;
+    if (onBorder(a, b, w, h, bt)) { lines.push({ p: a, d: [dx / len, dy / len], ok: false }); continue; }
+    let pts = [];
+    for (let s = 0; s < 40; s++) {
+      const t = 0.1 + 0.8 * s / 39, px = a[0] + dx * t, py = a[1] + dy * t;
+      let best = 0, bo = null;
+      for (let o = -R; o <= R; o += 0.5) {
+        const v1 = at(px + nx * (o + 1), py + ny * (o + 1)), v0 = at(px + nx * (o - 1), py + ny * (o - 1));
+        if (v1 === null || v0 === null) continue;
+        const v = Math.abs(v1 - v0);
+        if (v > best) { best = v; bo = o; }
+      }
+      if (bo !== null && best > 6) pts.push([px + nx * bo, py + ny * bo]);
+    }
+    let line = null;
+    for (let it = 0; it < 3 && pts.length >= 8; it++) {
+      const mx = pts.reduce((s, p) => s + p[0], 0) / pts.length, my = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+      let sxx = 0, sxy = 0, syy = 0;
+      for (const [x, y] of pts) { sxx += (x - mx) ** 2; sxy += (x - mx) * (y - my); syy += (y - my) ** 2; }
+      const th = 0.5 * Math.atan2(2 * sxy, sxx - syy), d = [Math.cos(th), Math.sin(th)];
+      line = { p: [mx, my], d, ok: true };
+      const res = pts.map(([x, y]) => Math.abs((x - mx) * -d[1] + (y - my) * d[0]));
+      const lim = Math.max(1, [...res].sort((u, v) => u - v)[Math.floor(res.length * 0.7)] * 2);
+      pts = pts.filter((_, i) => res[i] <= lim);
+    }
+    lines.push(line && pts.length >= 8 ? line : { p: a, d: [dx / len, dy / len], ok: false });
   }
-  const r = Math.max(1, Math.round(Math.max(w, h) / 160));
-  let best = null;
-  for (const ch of [paper, gray]) {
-    const bl = boxBlur(ch, w, h, r);
-    const t = otsu(bl);
-    let mask = new Uint8Array(n);
-    for (let i = 0; i < n; i++) mask[i] = bl[i] > t ? 1 : 0;
-    mask = morph(morph(mask, w, h, r, false), w, h, r, true); // öffnen: dünne Brücken weg
-    mask = morph(morph(mask, w, h, r * 2, true), w, h, r * 2, false); // schließen: Schrift-Löcher zu
-    const res = quadFromMask(mask, w, h);
-    if (res && (!best || res.score > best.score)) best = res;
-    if (best && best.score > 0.97) break;
+  const out = [];
+  for (let k = 0; k < 4; k++) {
+    const L1 = lines[(k + 3) % 4], L2 = lines[k];
+    const det = L1.d[0] * -L2.d[1] + L2.d[0] * L1.d[1];
+    let c = q[k];
+    if ((L1.ok || L2.ok) && Math.abs(det) > 0.2) {
+      const t = ((L2.p[0] - L1.p[0]) * -L2.d[1] + L2.d[0] * (L2.p[1] - L1.p[1])) / det;
+      const cand = [L1.p[0] + L1.d[0] * t, L1.p[1] + L1.d[1] * t];
+      if (Math.hypot(cand[0] - c[0], cand[1] - c[1]) < diag * 0.025) c = cand;
+    }
+    out.push([c[0] / scale, c[1] / scale]);
   }
-  if (!best) return null;
-  // minimal nach innen (0,8 % zur Mitte), damit kein dunkler Tischrand im Scan bleibt
-  const cx = best.quad.reduce((a, p) => a + p[0], 0) / 4, cy = best.quad.reduce((a, p) => a + p[1], 0) / 4;
-  best.quad = best.quad.map(([x, y]) => [x + (cx - x) * 0.008, y + (cy - y) * 0.008]);
-  return best.quad.map(([x, y]) => [Math.min(srcW, Math.max(0, x / scale)), Math.min(srcH, Math.max(0, y / scale))]);
+  return out;
+}
+
+// Kompatibel zur ersten Version: nur sichere Treffer, sonst null
+export function detectQuad(src, srcW, srcH, maxSide = 512) {
+  const r = findDocument(src, srcW, srcH, { maxSide });
+  return r && r.confident ? r.quad : null;
 }
 
 export function defaultQuad(w, h, inset = 0.04) {
@@ -291,6 +560,7 @@ export function warp(srcCanvas, quad, maxLong = 2339) {
       const d = M[6] * xx + M[7] * yy + 1;
       let sx = (M[0] * xx + M[1] * yy + M[2]) / d - 0.5;
       let sy = (M[3] * xx + M[4] * yy + M[5]) / d - 0.5;
+      if (sx < -1 || sy < -1 || sx > sw || sy > sh) { const o = (y * W + x) * 4; od[o] = od[o + 1] = od[o + 2] = od[o + 3] = 255; continue; }
       if (sx < 0) sx = 0; else if (sx > sw - 1.001) sx = sw - 1.001;
       if (sy < 0) sy = 0; else if (sy > sh - 1.001) sy = sh - 1.001;
       const x0 = sx | 0, y0 = sy | 0, fx = sx - x0, fy = sy - y0;

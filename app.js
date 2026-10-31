@@ -5,20 +5,21 @@ import { buildPdf } from './pdf.js';
 import * as DB from './store.js';
 import * as DBX from './dropbox.js';
 
-export const VERSION = '1.0.1';
+export const VERSION = '1.1.0';
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const SRC_MAX = 3000;          // Originalfotos auf max. 3000 px lange Seite
 const OUT_MAX = Math.round(11.69 * CONFIG.DPI); // A4 lang bei Ziel-DPI
+const DEF_OPTS = { native: false, filter: 'farbe', auto: true, lastFirma: null };
 const opts = loadOpts();
 
 let pages = [];                // aktueller Scan
-let stream = null, liveTimer = null, lastLiveQuad = null;
+let stream = null, liveTimer = null;
 let editing = null;            // { page, img, canvas, quad, scale, ox, oy, view }
 let retakeId = null;
 
-function loadOpts() { try { return Object.assign({ native: false, filter: 'farbe' }, JSON.parse(localStorage.getItem('fmrs_scanner_opts') || '{}')); } catch { return { native: false, filter: 'farbe' }; } }
-function saveOpts() { localStorage.setItem('fmrs_scanner_opts', JSON.stringify(opts)); }
+function loadOpts() { try { return Object.assign({}, DEF_OPTS, JSON.parse(localStorage.getItem('fmrs_scanner_opts') || '{}')); } catch { return Object.assign({}, DEF_OPTS); } }
+function saveOpts() { try { localStorage.setItem('fmrs_scanner_opts', JSON.stringify(opts)); } catch {} }
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 function toast(msg, ms = 2600) {
@@ -35,60 +36,158 @@ function show(id) {
 const current = () => $$('.screen').find(s => s.classList.contains('on'))?.id;
 
 // ---------- Kamera ----------
+const live = { q: null, miss: 0, stableSince: 0, armed: true, prev: null, sharp: [], busy: false, shooting: false, lastShot: 0 };
+let track = null, torchOn = false, audioCtx = null;
+
 async function startCamera() {
-  updateThumb();
-  if (opts.native) { $('#nocam').classList.add('hidden'); $('#hint').textContent = 'Auslöser öffnet die iPhone-Kamera'; return; }
+  updateThumb(); updateAutoChip();
+  if (opts.native) { $('#nocam').classList.add('hidden'); setHint('Auslöser öffnet die iPhone-Kamera'); return; }
   if (stream) return;
   if (!navigator.mediaDevices?.getUserMedia) return noCamera();
   try {
+    // höchste Auflösung anfragen, die das Handy liefert (4:3 wie die Fotokamera)
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 4032 }, height: { ideal: 3024 } },
     });
     if (current() !== 's-cam') { stopCamera(); return; }
+    track = stream.getVideoTracks()[0];
     const v = $('#video'); v.srcObject = stream; await v.play().catch(() => {});
     $('#nocam').classList.add('hidden');
-    liveTimer = setInterval(liveDetect, 350);
+    // Dauer-Autofokus und automatische Belichtung, wo der Browser das kann
+    try {
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      const adv = [];
+      if (caps.focusMode && caps.focusMode.includes('continuous')) adv.push({ focusMode: 'continuous' });
+      if (caps.exposureMode && caps.exposureMode.includes('continuous')) adv.push({ exposureMode: 'continuous' });
+      if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) adv.push({ whiteBalanceMode: 'continuous' });
+      if (adv.length) await track.applyConstraints({ advanced: adv }).catch(() => {});
+      $('#torchBtn').classList.toggle('hidden', !caps.torch);
+    } catch { $('#torchBtn').classList.add('hidden'); }
+    torchOn = false; $('#torchBtn').classList.remove('on');
+    Object.assign(live, { q: null, miss: 0, stableSince: 0, armed: true, prev: null, sharp: [] });
+    liveTimer = setInterval(liveDetect, 220);
   } catch (e) { noCamera(); }
 }
-function noCamera() { $('#nocam').classList.remove('hidden'); $('#hint').textContent = 'Foto aufnehmen oder aus Fotos wählen'; }
+function noCamera() { $('#nocam').classList.remove('hidden'); setHint('Foto aufnehmen oder aus Fotos wählen'); }
 function stopCamera() {
   clearInterval(liveTimer); liveTimer = null;
-  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; track = null; }
   const v = $('#video'); v.srcObject = null;
   const o = $('#overlay'); o.getContext('2d').clearRect(0, 0, o.width, o.height);
+  setProgress(0);
 }
+async function toggleTorch() {
+  if (!track) return;
+  torchOn = !torchOn;
+  try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); } catch { torchOn = false; toast('Licht geht hier nicht'); }
+  $('#torchBtn').classList.toggle('on', torchOn);
+}
+function setHint(t, ok) { const h = $('#hint'); h.textContent = t; h.classList.toggle('ok', !!ok); }
+function setProgress(f) { $('#shutter').style.setProperty('--p', Math.max(0, Math.min(1, f)).toFixed(3)); }
+function updateAutoChip() { const c = $('#autoChip'); c.textContent = opts.auto ? 'Auto an' : 'Auto aus'; c.classList.toggle('on', !!opts.auto); }
+
 function videoMap() { // Video-Koordinaten -> Bildschirm (object-fit: cover)
   const v = $('#video'), W = v.clientWidth, H = v.clientHeight, vw = v.videoWidth, vh = v.videoHeight;
   const s = Math.max(W / vw, H / vh);
   return { s, ox: (W - vw * s) / 2, oy: (H - vh * s) / 2, W, H };
 }
-function liveDetect() {
-  const v = $('#video');
-  if (!v.videoWidth || document.hidden) return;
-  const q = S.detectQuad(v, v.videoWidth, v.videoHeight, 320);
-  lastLiveQuad = q;
-  const o = $('#overlay'), m = videoMap(), dpr = devicePixelRatio || 1;
-  o.width = m.W * dpr; o.height = m.H * dpr;
-  const g = o.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, m.W, m.H);
-  const hint = $('#hint');
-  if (q) {
-    g.beginPath(); q.forEach(([x, y], i) => g[i ? 'lineTo' : 'moveTo'](x * m.s + m.ox, y * m.s + m.oy)); g.closePath();
-    g.fillStyle = '#f08a3c22'; g.fill(); g.lineWidth = 3; g.strokeStyle = '#f08a3c'; g.stroke();
-    hint.textContent = 'Blatt erkannt'; hint.classList.add('ok');
-  } else { hint.textContent = 'Blatt ins Bild halten'; hint.classList.remove('ok'); }
+const maxDist = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p[0] - b[i][0], p[1] - b[i][1])));
+
+// Bewegung und Schärfe aus einem kleinen Graubild
+const statCanvas = S.makeCanvas(96, 72);
+function frameStats(v) {
+  const g = statCanvas.getContext('2d', { willReadFrequently: true });
+  g.drawImage(v, 0, 0, 96, 72);
+  const d = g.getImageData(0, 0, 96, 72).data, gray = new Float32Array(96 * 72);
+  for (let i = 0, j = 0; i < gray.length; i++, j += 4) gray[i] = d[j] * 0.3 + d[j + 1] * 0.59 + d[j + 2] * 0.11;
+  let motion = 0;
+  if (live.prev) { for (let i = 0; i < gray.length; i++) motion += Math.abs(gray[i] - live.prev[i]); motion /= gray.length; }
+  live.prev = gray;
+  let s = 0, s2 = 0, n = 0; // Varianz des Laplace-Filters = Schärfe
+  for (let y = 1; y < 71; y++) for (let x = 1; x < 95; x++) {
+    const i = y * 96 + x, l = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - 96] - gray[i + 96];
+    s += l; s2 += l * l; n++;
+  }
+  return { motion, sharp: s2 / n - (s / n) ** 2 };
 }
 
-async function shoot() {
-  if (opts.native || !stream) { $('#fileCam').click(); return; }
-  const v = $('#video'); if (!v.videoWidth) return;
-  const btn = $('#shutter'); if (btn.classList.contains('busy')) return;
-  btn.classList.add('busy');
-  const f = $('#flash'); f.classList.add('go'); requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('go')));
+function liveDetect() {
+  const v = $('#video');
+  if (!v.videoWidth || document.hidden || live.busy || live.shooting) return;
+  live.busy = true;
   try {
-    const { canvas } = S.scaledCanvas(v, v.videoWidth, v.videoHeight, SRC_MAX);
-    await addPageFromCanvas(canvas);
-  } finally { btn.classList.remove('busy'); }
+    const now = performance.now(), vw = v.videoWidth, vh = v.videoHeight, diag = Math.hypot(vw, vh);
+    const st = frameStats(v);
+    const r = S.findDocument(v, vw, vh, { maxSide: 360, refine: false });
+    if (r && r.confident) {
+      live.miss = 0;
+      if (live.q && maxDist(r.quad, live.q) < diag * 0.06) {
+        const dev = maxDist(r.quad, live.q);
+        live.q = live.q.map((p, i) => [p[0] * 0.55 + r.quad[i][0] * 0.45, p[1] * 0.55 + r.quad[i][1] * 0.45]); // glätten
+        if (dev > diag * 0.015) live.stableSince = now;
+      } else { live.q = r.quad; live.stableSince = now; }
+    } else if (++live.miss >= 3) { live.q = null; live.stableSince = 0; }
+    if (st.motion > 6) live.stableSince = now;
+    if (st.motion > 14 || (!live.q && live.miss >= 4)) live.armed = true; // Blatt gewechselt
+    live.sharp.push([now, st.sharp]); live.sharp = live.sharp.filter(([t]) => now - t < 3000);
+    const sharpOk = st.sharp >= 0.7 * Math.max(...live.sharp.map(s => s[1]));
+
+    // Anzeige
+    const o = $('#overlay'), m = videoMap(), dpr = devicePixelRatio || 1;
+    o.width = m.W * dpr; o.height = m.H * dpr;
+    const g = o.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, m.W, m.H);
+    const held = live.q && live.stableSince ? now - live.stableSince : 0;
+    if (live.q) {
+      g.beginPath(); live.q.forEach(([x, y], i) => g[i ? 'lineTo' : 'moveTo'](x * m.s + m.ox, y * m.s + m.oy)); g.closePath();
+      g.fillStyle = '#f08a3c22'; g.fill(); g.lineWidth = 3; g.strokeStyle = '#f08a3c'; g.stroke();
+      if (!live.armed) setHint('Aufgenommen. Nächste Seite hinlegen', true);
+      else setHint(opts.auto ? (sharpOk ? 'Blatt erkannt, ruhig halten …' : 'Blatt erkannt, wird scharf …') : 'Blatt erkannt', true);
+    } else setHint(live.armed ? 'Blatt ins Bild halten' : 'Aufgenommen. Nächste Seite hinlegen', !live.armed);
+    const AUTO_MS = 800;
+    setProgress(opts.auto && live.armed && live.q ? held / AUTO_MS : 0);
+    if (opts.auto && live.armed && live.q && held >= AUTO_MS && sharpOk && now - live.lastShot > 1500) {
+      live.armed = false; setProgress(0);
+      shoot(true);
+    }
+  } finally { live.busy = false; }
+}
+
+function signal() {
+  const f = $('#flash'); f.classList.add('go'); requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('go')));
+  try { navigator.vibrate && navigator.vibrate(40); } catch {}
+  try { // kurzer Klick
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator(), gn = audioCtx.createGain();
+    o.frequency.value = 1400; gn.gain.setValueAtTime(0.08, audioCtx.currentTime); gn.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.06);
+    o.connect(gn).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + 0.07);
+  } catch {}
+}
+
+async function shoot(auto) {
+  if (opts.native || !stream) { $('#fileCam').click(); return; }
+  const v = $('#video'); if (!v.videoWidth || live.shooting) return;
+  live.shooting = true; live.lastShot = performance.now(); live.armed = false;
+  const btn = $('#shutter'); btn.classList.add('busy');
+  signal();
+  try {
+    const vw = v.videoWidth, vh = v.videoHeight, hint = live.q && live.q.map(p => p.slice());
+    let canvas = null;
+    // 1) echtes Foto über ImageCapture (volle Sensorauflösung, wo vorhanden)
+    if (window.ImageCapture && track) {
+      try {
+        const blob = await new ImageCapture(track).takePhoto();
+        const img = await S.loadImage(blob);
+        if (img.naturalWidth > vw) canvas = S.scaledCanvas(img, img.naturalWidth, img.naturalHeight, SRC_MAX).canvas;
+      } catch {}
+    }
+    // 2) sonst Standbild aus dem Video in voller Video-Auflösung
+    if (!canvas) canvas = S.scaledCanvas(v, vw, vh, SRC_MAX).canvas;
+    // Live-Ecken auf das große Bild umrechnen (nur bei gleichem Seitenverhältnis)
+    let hq = null;
+    if (hint && Math.abs(canvas.width / canvas.height - vw / vh) < 0.02) { const k = canvas.width / vw; hq = hint.map(([x, y]) => [x * k, y * k]); }
+    await addPageFromCanvas(canvas, hq);
+  } finally { btn.classList.remove('busy'); live.shooting = false; }
 }
 
 async function addFiles(files) {
@@ -97,28 +196,40 @@ async function addFiles(files) {
     try {
       const img = await S.loadImage(file);
       const { canvas } = S.scaledCanvas(img, img.naturalWidth, img.naturalHeight, SRC_MAX);
-      await addPageFromCanvas(canvas);
+      await addPageFromCanvas(canvas, null);
     } catch (e) { toast('Bild konnte nicht gelesen werden'); }
   }
 }
 
-async function addPageFromCanvas(canvas) {
-  const quad = S.detectQuad(canvas, canvas.width, canvas.height, 480);
+// Ecken im großen Bild bestimmen: eigene Erkennung, sonst Live-Ecken nachverfeinert, sonst Vorschlag/ganzes Bild
+function locate(canvas, hint) {
+  const W = canvas.width, H = canvas.height;
+  const r = S.findDocument(canvas, W, H, { maxSide: 640 });
+  if (r && r.confident) {
+    if (!hint || maxDist(r.quad, hint) < Math.hypot(W, H) * 0.08) return { quad: r.quad, sure: true };
+  }
+  if (hint) return { quad: S.refineQuad(canvas, W, H, hint), sure: true };
+  if (r && r.score > 0.45) return { quad: r.quad, sure: false };
+  return { quad: S.defaultQuad(W, H, 0), sure: false };
+}
+
+async function addPageFromCanvas(canvas, hint) {
+  const { quad, sure } = locate(canvas, hint);
   const src = await S.canvasToBlob(canvas, 'image/jpeg', 0.9);
   let page;
   if (retakeId && pages.find(p => p.id === retakeId)) {
     page = pages.find(p => p.id === retakeId);
-    Object.assign(page, { src, w: canvas.width, h: canvas.height, quad: quad || S.defaultQuad(canvas.width, canvas.height), detected: !!quad, rot: 0 });
+    Object.assign(page, { src, w: canvas.width, h: canvas.height, quad, detected: sure, rot: 0 });
     retakeId = null;
   } else {
-    page = { id: uid(), order: Date.now(), src, w: canvas.width, h: canvas.height, quad: quad || S.defaultQuad(canvas.width, canvas.height), detected: !!quad, rot: 0, filter: opts.filter };
+    page = { id: uid(), order: Date.now(), src, w: canvas.width, h: canvas.height, quad, detected: sure, rot: 0, filter: opts.filter };
     pages.push(page);
   }
   await processPage(page, canvas);
   await DB.put('pages', page);
   updateThumb();
-  if (!quad) { toast('Rand nicht sicher erkannt, bitte Ecken prüfen'); openEditor(page); }
-  else if (current() === 's-cam') toast(`Seite ${pages.length} aufgenommen`, 1400);
+  if (!sure) { toast('Rand nicht sicher erkannt, bitte Ecken prüfen'); openEditor(page); }
+  else if (current() === 's-cam') toast(`Seite ${pages.length} ✓`, 1200);
   else if (current() === 's-edit') openEditor(page);
 }
 
@@ -272,7 +383,7 @@ function updateSend() {
   $$('#art button').forEach(b => b.classList.toggle('on', b.dataset.v === sel.art));
   const ok = pages.length > 0 && !!sel.firma;
   $('#sendBtn').disabled = !ok;
-  $('#sendBtn').textContent = !pages.length ? 'Keine Seiten' : !sel.firma ? 'Erst Firma wählen' : 'Hochladen';
+  $('#sendBtn').textContent = !pages.length ? 'Keine Seiten' : !sel.firma ? 'Erst Firma wählen' : `Hochladen · ${FIRMA_TXT[sel.firma]}`;
   const bytes = pages.reduce((s, p) => s + (p.out ? p.out.size : 0), 0);
   $('#sizeInfo').textContent = pages.length ? `ca. ${(bytes / 1048576).toFixed(1)} MB` : '';
 }
@@ -293,7 +404,7 @@ async function discardAll() {
   if (pages.length && !confirm('Alle Seiten dieses Scans verwerfen?')) return;
   pages = []; await DB.clear('pages'); resetForm(); updateThumb(); show('s-cam');
 }
-function resetForm() { sel.firma = null; sel.art = null; $('#note').value = ''; $('#split').checked = false; $('#s-review').dataset.from = ''; }
+function resetForm() { sel.firma = opts.lastFirma || null; sel.art = null; $('#note').value = ''; $('#split').checked = false; $('#s-review').dataset.from = ''; }
 
 // ---------- Dateiname, Abholzeit ----------
 function berlinParts(d = new Date()) {
@@ -347,23 +458,28 @@ async function send() {
       ].join('\n') : null;
       await DB.put('docs', { id: uid(), name: base + '.pdf', base, firma: sel.firma, art: sel.art, note, pages: groups[i].length, created: now.getTime(), status: 'wartet', pdf, size: pdf.size, txt, txtDone: false });
     }
+    opts.lastFirma = sel.firma; saveOpts();
     pages = []; await DB.clear('pages'); resetForm(); updateThumb();
-    $('#doneBox').classList.remove('hidden');
-    $('#doneMsg').textContent = groups.length > 1 ? `${groups.length} Dokumente gespeichert. Werden hochgeladen …` : 'Gespeichert. Wird hochgeladen …';
-    show('s-list');
-    await processQueue();
+    show('s-cam');
+    toast(groups.length > 1 ? `${groups.length} Dokumente, werden hochgeladen …` : 'Wird hochgeladen …', 1500);
+    processQueue().then(r => {
+      if (!r) return;
+      if (r.waiting) toast(r.auth ? 'Gespeichert. Wartet: Dropbox nicht verbunden' : 'Gespeichert. Wartet auf Netz, geht später von selbst raus', 3500);
+      else if (r.uploaded) toast(`Hochgeladen ✓  Abholung ${nextRun()}`, 3000);
+    });
   } catch (e) {
     toast('Fehler beim PDF: ' + e.message, 5000);
   } finally { updateSend(); }
 }
 
 // ---------- Warteschlange ----------
-let queueBusy = false;
+let queueBusy = false, queueAgain = false;
 async function processQueue() {
-  if (queueBusy) return; queueBusy = true;
+  if (queueBusy) { queueAgain = true; return null; } queueBusy = true; queueAgain = false;
   let uploaded = 0, waiting = 0, authProblem = false, netProblem = false;
   try {
     const docs = (await DB.all('docs')).filter(d => d.status !== 'hochgeladen').sort((a, b) => a.created - b.created);
+    if (docs.length) await refreshQueueChip();
     for (const d of docs) {
       if (!DBX.isConnected()) { authProblem = true; waiting++; continue; }
       if (authProblem || netProblem) { waiting++; continue; }
@@ -382,14 +498,10 @@ async function processQueue() {
     }
     await prune();
   } finally { queueBusy = false; }
-  if (uploaded && !waiting) {
-    $('#doneMsg').textContent = `Hochgeladen. Wird beim nächsten Durchlauf ${nextRun()} verarbeitet.`;
-  } else if (waiting) {
-    $('#doneMsg').textContent = authProblem ? 'Gespeichert, wartet auf Upload: Dropbox ist nicht verbunden.' : 'Gespeichert, wartet auf Upload (kein Netz). Geht automatisch raus, sobald Netz da ist.';
-  }
+  if (queueAgain) return processQueue(); // während des Hochladens kam ein neues Dokument dazu
   await refreshQueueChip();
   if (current() === 's-list') renderList();
-  return { uploaded, waiting };
+  return { uploaded, waiting, auth: authProblem };
 }
 async function prune() { // hochgeladene Einträge: nur die letzten 40, max. 60 Tage
   const docs = (await DB.all('docs')).filter(d => d.status === 'hochgeladen').sort((a, b) => b.created - a.created);
@@ -399,8 +511,11 @@ async function prune() { // hochgeladene Einträge: nur die letzten 40, max. 60 
 async function refreshQueueChip() {
   const n = (await DB.all('docs')).filter(d => d.status !== 'hochgeladen').length;
   const c = $('#queueChip');
-  c.textContent = n ? `${n} wartet auf Upload` : 'Verlauf';
+  c.textContent = n ? `⇡ ${n} wartet` : 'Verlauf';
   c.classList.toggle('warn', n > 0);
+  const up = queueBusy && n > 0;
+  $('#queueBadge').textContent = n ? (up ? `⇡ ${n} lädt hoch` : `⇡ ${n} wartet`) : '';
+  $('#queueBadge').classList.toggle('hidden', !n);
 }
 async function renderList() {
   $('#connWarn').classList.toggle('hidden', DBX.isConnected());
@@ -427,6 +542,7 @@ function renderSettings() {
   $('#appKey').value = DBX.appKey();
   $('#keyBox').classList.toggle('hidden', !!CONFIG.DROPBOX_APP_KEY);
   $('#optNative').checked = !!opts.native;
+  $('#optAuto').checked = !!opts.auto;
   $$('#optFilter button').forEach(b => b.classList.toggle('on', b.dataset.v === opts.filter));
   $('#folderName').textContent = CONFIG.FOLDER;
   $('#runTimes').textContent = CONFIG.RUNS.join(', ');
@@ -448,14 +564,28 @@ async function manualFinish() {
   catch (e) { toast('Hat nicht geklappt: ' + e.message, 5000); }
 }
 
+// ---------- Neue Version? ----------
+let lastUpdateCheck = 0;
+async function checkUpdate(force) {
+  if (!force && Date.now() - lastUpdateCheck < 5 * 60000) return;
+  lastUpdateCheck = Date.now();
+  try {
+    const j = await (await fetch('version.json?t=' + Date.now(), { cache: 'no-store' })).json();
+    if (j.version && j.version !== VERSION) $('#updateBar').classList.remove('hidden');
+  } catch {}
+}
+
 // ---------- Start ----------
 const ACT = {
-  shoot, review: () => pages.length && show('s-review'), cam: () => show('s-cam'),
+  shoot: () => shoot(false), torch: toggleTorch,
+  autoToggle: () => { opts.auto = !opts.auto; saveOpts(); updateAutoChip(); toast(opts.auto ? 'Automatisch auslösen an' : 'Automatisch auslösen aus', 1400); },
+  update: () => { navigator.serviceWorker?.getRegistration().then(r => r && r.update()).finally(() => setTimeout(() => location.reload(), 300)); },
+  review: () => pages.length && show('s-review'), cam: () => show('s-cam'),
   list: () => { $('#doneBox').classList.add('hidden'); show('s-list'); }, settings: () => show('s-settings'),
   photo: () => $('#fileCam').click(), library: () => $('#fileLib').click(),
   editCancel: () => { const p = editing?.page; editing = null; show(p && p.out ? (pages.length > 1 ? 's-review' : 's-cam') : 's-cam'); },
   toggleView: () => setView(editing.view === 'crop' ? 'result' : 'crop'),
-  autoQuad: () => { const { img } = editing; const q = S.detectQuad(img, img.naturalWidth, img.naturalHeight, 480); if (q) { editing.quad = q; editing.dirty = true; setView('crop'); } else toast('Kein Blatt gefunden'); },
+  autoQuad: () => { const { img } = editing; const r = S.findDocument(img, img.naturalWidth, img.naturalHeight, { maxSide: 640 }); if (r && r.score > 0.45) { editing.quad = r.quad; editing.dirty = true; setView('crop'); if (!r.confident) toast('Unsicher, bitte Ecken prüfen'); } else toast('Kein Blatt gefunden'); },
   fullQuad: () => { const { img } = editing; editing.quad = S.defaultQuad(img.naturalWidth, img.naturalHeight, 0); editing.dirty = true; setView('crop'); },
   retake: () => { retakeId = editing.page.id; editing = null; show('s-cam'); toast('Seite neu aufnehmen'); },
   delPage: () => deletePage(editing.page), rotate: rotatePage, editOk,
@@ -473,12 +603,15 @@ async function init() {
   $$('#art button').forEach(b => b.onclick = () => { sel.art = sel.art === b.dataset.v ? null : b.dataset.v; updateSend(); });
   $$('#optFilter button').forEach(b => b.onclick = () => { opts.filter = b.dataset.v; saveOpts(); renderSettings(); });
   $('#optNative').onchange = e => { opts.native = e.target.checked; saveOpts(); };
+  $('#optAuto').onchange = e => { opts.auto = e.target.checked; saveOpts(); };
+  // Ton für den Auslöser darf erst nach einer Berührung starten (iOS)
+  document.addEventListener('pointerdown', () => { try { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); if (audioCtx.state === 'suspended') audioCtx.resume(); } catch {} }, { passive: true });
   $('#fileCam').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
   $('#fileLib').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
   initHandles();
   addEventListener('resize', () => { if (editing && editing.view === 'crop') layoutEditor(); });
   addEventListener('online', () => processQueue());
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) processQueue(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { processQueue(); checkUpdate(); } });
   setInterval(() => { if (!document.hidden) processQueue(); }, 60000);
 
   // Warteschlange vor dem Aufräumen durch den Browser schützen
@@ -488,8 +621,10 @@ async function init() {
   const r = await DBX.handleRedirect();
   if (r) { toast(r.ok ? 'Dropbox verbunden' : 'Dropbox: ' + r.msg, 4000); }
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  resetForm();
   show(r ? 's-settings' : 's-cam');
-  processQueue();
+  processQueue().then(res => { if (res && res.uploaded && !res.waiting) toast(`Wartende Scans hochgeladen ✓`, 2500); });
+  checkUpdate();
 }
-window.__scanner = { S, pages: () => pages, processQueue, nextRun, fileBase, DB, DBX, VERSION };
+window.__scanner = { S, pages: () => pages, processQueue, nextRun, fileBase, DB, DBX, VERSION, checkUpdate, live };
 init();

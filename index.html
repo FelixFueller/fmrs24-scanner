@@ -30,14 +30,18 @@
   </div>
   <header class="bar top">
     <button class="chip" id="queueChip" data-act="list">Verlauf</button>
-    <span class="brand">FMRS<b>·</b>SCAN</span>
-    <button class="icon" data-act="settings" aria-label="Einstellungen">⚙</button>
+    <span class="grp">
+      <button class="chip" id="autoChip" data-act="autoToggle">Auto an</button>
+      <button class="icon hidden" id="torchBtn" data-act="torch" aria-label="Licht">ϟ</button>
+      <button class="icon" data-act="settings" aria-label="Einstellungen">⚙</button>
+    </span>
   </header>
   <div id="hint" class="hint">Blatt ins Bild halten</div>
+  <div id="queueBadge" class="qbadge hidden" data-act="list"></div>
   <footer class="bar bottom">
-    <button id="thumbBtn" class="thumb" data-act="review" aria-label="Seiten ansehen"><img id="thumbImg" alt=""><span id="pageCount">0</span></button>
-    <button id="shutter" class="shutter" data-act="shoot" aria-label="Aufnehmen"><i></i></button>
     <button class="side" data-act="library" aria-label="Aus Fotos wählen">Fotos</button>
+    <button id="shutter" class="shutter" data-act="shoot" aria-label="Aufnehmen"><i></i></button>
+    <button id="thumbBtn" class="thumb" data-act="review" aria-label="Fertig, Seiten ansehen"><img id="thumbImg" alt=""><span id="pageCount">0</span><b>Fertig</b></button>
   </footer>
 </section>
 
@@ -103,8 +107,8 @@
     <h3>Notiz <em>freiwillig</em></h3>
     <textarea id="note" rows="2" maxlength="500" placeholder="z.B. bezahlt, bitte Frist eintragen"></textarea>
     <p id="sizeInfo" class="mut"></p>
-    <button class="big send" id="sendBtn" data-act="send" disabled>Hochladen</button>
   </div>
+  <div class="sendbar"><button class="big send" id="sendBtn" data-act="send" disabled>Hochladen</button></div>
 </section>
 
 <!-- Verlauf / Bestätigung -->
@@ -150,6 +154,7 @@
     <button class="big ghost hidden" id="disconnectBtn" data-act="disconnect">Dropbox trennen</button>
 
     <h3>Kamera</h3>
+    <label class="switch"><input type="checkbox" id="optAuto"> <span>Automatisch auslösen, wenn das Blatt ruhig und scharf im Bild ist</span></label>
     <label class="switch"><input type="checkbox" id="optNative"> <span>iPhone-Kamera statt Live-Bild verwenden (schärfer, ein Tipp mehr)</span></label>
     <h3>Standard-Filter</h3>
     <div class="choice small" id="optFilter">
@@ -165,6 +170,7 @@
 <input type="file" id="fileCam" accept="image/*" capture="environment" hidden>
 <input type="file" id="fileLib" accept="image/*" multiple hidden>
 <div id="toast"></div>
+<div id="updateBar" class="updatebar hidden">Neue Version da. <button class="chip on" data-act="update">Jetzt neu öffnen</button></div>
 <script type="module" src="app.js"></script>
 </body>
 </html>
