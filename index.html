@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b0d10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="FMRS Scan">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob: mediastream:; connect-src 'self' https://api.dropboxapi.com https://content.dropboxapi.com; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self'; form-action 'none'; base-uri 'self'">
+<title>FMRS Scan</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- Kamera -->
+<section id="s-cam" class="screen on">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <div id="flash"></div>
+  <div id="nocam" class="center hidden">
+    <p>Live-Kamera nicht verfügbar.</p>
+    <button class="big" data-act="photo">Foto aufnehmen</button>
+    <button class="big ghost" data-act="library">Aus Fotos wählen</button>
+  </div>
+  <header class="bar top">
+    <button class="chip" id="queueChip" data-act="list">Verlauf</button>
+    <span class="brand">FMRS<b>·</b>SCAN</span>
+    <button class="icon" data-act="settings" aria-label="Einstellungen">⚙</button>
+  </header>
+  <div id="hint" class="hint">Blatt ins Bild halten</div>
+  <footer class="bar bottom">
+    <button id="thumbBtn" class="thumb" data-act="review" aria-label="Seiten ansehen"><img id="thumbImg" alt=""><span id="pageCount">0</span></button>
+    <button id="shutter" class="shutter" data-act="shoot" aria-label="Aufnehmen"><i></i></button>
+    <button class="side" data-act="library" aria-label="Aus Fotos wählen">Fotos</button>
+  </footer>
+</section>
+
+<!-- Seite bearbeiten -->
+<section id="s-edit" class="screen">
+  <header class="bar top">
+    <button class="icon" data-act="editCancel" aria-label="Zurück">‹</button>
+    <span class="title" id="editTitle">Seite</span>
+    <button class="chip" id="viewToggle" data-act="toggleView">Ergebnis</button>
+  </header>
+  <div id="editArea">
+    <canvas id="editCanvas"></canvas>
+    <canvas id="editQuad"></canvas>
+    <div class="handle" data-i="0"></div><div class="handle" data-i="1"></div><div class="handle" data-i="2"></div><div class="handle" data-i="3"></div>
+    <canvas id="loupe" width="140" height="140"></canvas>
+    <img id="editResult" class="hidden" alt="">
+    <div id="busy" class="hidden"><span></span></div>
+  </div>
+  <div class="tools">
+    <div class="row">
+      <button class="chip f" data-filter="farbe">Farbe</button>
+      <button class="chip f" data-filter="grau">Grau</button>
+      <button class="chip f" data-filter="sw">S/W</button>
+      <button class="chip f" data-filter="original">Original</button>
+    </div>
+    <div class="row">
+      <button class="tool" data-act="rotate">⟳ Drehen</button>
+      <button class="tool" data-act="autoQuad">Auto</button>
+      <button class="tool" data-act="fullQuad">Ganz</button>
+      <button class="tool" data-act="retake">Neu</button>
+      <button class="tool bad" data-act="delPage">Löschen</button>
+    </div>
+    <button class="big" data-act="editOk">Fertig</button>
+  </div>
+</section>
+
+<!-- Dokument prüfen und senden -->
+<section id="s-review" class="screen scroll">
+  <header class="bar top solid">
+    <button class="icon" data-act="cam" aria-label="Zurück zur Kamera">‹</button>
+    <span class="title" id="reviewTitle">Dokument</span>
+    <button class="chip" data-act="discard">Verwerfen</button>
+  </header>
+  <div class="content">
+    <div id="pages" class="pages"></div>
+    <button class="big ghost" data-act="cam">+ Seite aufnehmen</button>
+    <label class="switch"><input type="checkbox" id="split"> <span>Jede Seite ist ein eigenes Dokument</span></label>
+
+    <h3>Von wem / für wen? <em>Pflicht</em></h3>
+    <div class="choice" id="firma">
+      <button data-v="FMRS">FMRS 24</button>
+      <button data-v="FAS">Füller Air Services</button>
+      <button data-v="PRIV">Privat</button>
+      <button data-v="UNKLAR">Weiß nicht</button>
+    </div>
+    <h3>Was ist es? <em>freiwillig</em></h3>
+    <div class="choice small" id="art">
+      <button data-v="Rechnung">Rechnung</button>
+      <button data-v="Brief">Brief</button>
+      <button data-v="Lieferschein">Lieferschein</button>
+      <button data-v="Sonstiges">Sonstiges</button>
+    </div>
+    <h3>Notiz <em>freiwillig</em></h3>
+    <textarea id="note" rows="2" maxlength="500" placeholder="z.B. bezahlt, bitte Frist eintragen"></textarea>
+    <p id="sizeInfo" class="mut"></p>
+    <button class="big send" id="sendBtn" data-act="send" disabled>Hochladen</button>
+  </div>
+</section>
+
+<!-- Verlauf / Bestätigung -->
+<section id="s-list" class="screen scroll">
+  <header class="bar top solid">
+    <button class="icon" data-act="cam" aria-label="Zur Kamera">‹</button>
+    <span class="title">Verlauf</span>
+    <button class="chip" data-act="retry">Nochmal senden</button>
+  </header>
+  <div class="content">
+    <div id="doneBox" class="done hidden">
+      <div class="check">✓</div>
+      <p id="doneMsg"></p>
+      <button class="big" data-act="cam">Nächster Scan</button>
+    </div>
+    <div id="connWarn" class="warnbox hidden">Dropbox ist nicht verbunden. Scans warten auf dem Handy. <button class="chip" data-act="settings">Verbinden</button></div>
+    <ul id="docList" class="docs"></ul>
+  </div>
+</section>
+
+<!-- Einstellungen -->
+<section id="s-settings" class="screen scroll">
+  <header class="bar top solid">
+    <button class="icon" data-act="cam" aria-label="Zurück">‹</button>
+    <span class="title">Einstellungen</span>
+    <span></span>
+  </header>
+  <div class="content">
+    <h3>Dropbox</h3>
+    <p id="dbxState" class="mut"></p>
+    <div id="keyBox">
+      <label class="lbl">App-Schlüssel (App key aus der Dropbox App Console)</label>
+      <input id="appKey" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="z.B. a1b2c3d4e5f6g7h">
+    </div>
+    <button class="big" id="connectBtn" data-act="connect">Mit Dropbox verbinden</button>
+    <details class="mut">
+      <summary>Kommt nach dem Anmelden nicht zurück?</summary>
+      <p>Dann so: Knopf drücken, bei Dropbox erlauben, den angezeigten Code kopieren, hier einfügen.</p>
+      <button class="big ghost" data-act="manualStart">Code-Anmeldung öffnen</button>
+      <input id="manualCode" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Code von Dropbox einfügen">
+      <button class="big ghost" data-act="manualFinish">Code übernehmen</button>
+    </details>
+    <button class="big ghost hidden" id="disconnectBtn" data-act="disconnect">Dropbox trennen</button>
+
+    <h3>Kamera</h3>
+    <label class="switch"><input type="checkbox" id="optNative"> <span>iPhone-Kamera statt Live-Bild verwenden (schärfer, ein Tipp mehr)</span></label>
+    <h3>Standard-Filter</h3>
+    <div class="choice small" id="optFilter">
+      <button data-v="farbe">Farbe</button><button data-v="grau">Grau</button><button data-v="sw">S/W</button><button data-v="original">Original</button>
+    </div>
+    <h3>Info</h3>
+    <p class="mut">Ziel: Dropbox-Ordner <b id="folderName"></b>. Abholung täglich <span id="runTimes"></span>. Daten bleiben auf diesem Handy, bis sie in deiner Dropbox sind. Keine anderen Dienste.</p>
+    <p class="mut small">Rücksprung-Adresse für Dropbox: <code id="redirUri"></code></p>
+    <p class="mut small">Version <span id="ver"></span></p>
+  </div>
+</section>
+
+<input type="file" id="fileCam" accept="image/*" capture="environment" hidden>
+<input type="file" id="fileLib" accept="image/*" multiple hidden>
+<div id="toast"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
