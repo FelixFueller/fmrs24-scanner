@@ -5,7 +5,7 @@ import { buildPdf } from './pdf.js';
 import * as DB from './store.js';
 import * as DBX from './dropbox.js';
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.1.1';
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const SRC_MAX = 3000;          // Originalfotos auf max. 3000 px lange Seite
@@ -65,7 +65,8 @@ async function startCamera() {
       $('#torchBtn').classList.toggle('hidden', !caps.torch);
     } catch { $('#torchBtn').classList.add('hidden'); }
     torchOn = false; $('#torchBtn').classList.remove('on');
-    Object.assign(live, { q: null, miss: 0, stableSince: 0, armed: true, prev: null, sharp: [] });
+    // 'armed' bleibt erhalten: liegt noch dieselbe Seite da, nicht nochmal auslösen (erst nach Bewegung)
+    Object.assign(live, { q: null, miss: 0, stableSince: 0, prev: null, sharp: [] });
     liveTimer = setInterval(liveDetect, 220);
   } catch (e) { noCamera(); }
 }
@@ -587,7 +588,7 @@ const ACT = {
   toggleView: () => setView(editing.view === 'crop' ? 'result' : 'crop'),
   autoQuad: () => { const { img } = editing; const r = S.findDocument(img, img.naturalWidth, img.naturalHeight, { maxSide: 640 }); if (r && r.score > 0.45) { editing.quad = r.quad; editing.dirty = true; setView('crop'); if (!r.confident) toast('Unsicher, bitte Ecken prüfen'); } else toast('Kein Blatt gefunden'); },
   fullQuad: () => { const { img } = editing; editing.quad = S.defaultQuad(img.naturalWidth, img.naturalHeight, 0); editing.dirty = true; setView('crop'); },
-  retake: () => { retakeId = editing.page.id; editing = null; show('s-cam'); toast('Seite neu aufnehmen'); },
+  retake: () => { retakeId = editing.page.id; editing = null; live.armed = true; show('s-cam'); toast('Seite neu aufnehmen'); },
   delPage: () => deletePage(editing.page), rotate: rotatePage, editOk,
   discard: discardAll, send, retry: () => processQueue().then(r => toast(r.waiting ? 'Noch nicht geklappt, versuche es später wieder' : 'Alles hochgeladen')),
   connect, manualStart, manualFinish,
@@ -618,6 +619,7 @@ async function init() {
   if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
   // offener Scan von vorher wiederherstellen
   pages = (await DB.all('pages')).sort((a, b) => a.order - b.order);
+  live.armed = pages.length === 0; // App mit offenen Seiten neu geöffnet: erst nach Blattwechsel auslösen
   const r = await DBX.handleRedirect();
   if (r) { toast(r.ok ? 'Dropbox verbunden' : 'Dropbox: ' + r.msg, 4000); }
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
